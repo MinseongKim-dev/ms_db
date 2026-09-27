@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-MS_DB is a personal toy database engine written from scratch in Go (module `github.com/MinseongKim-dev/ms_db`, Go 1.22), following a 5-phase roadmap equivalent to CMU 15-445 BusTub. Implemented so far: `storage.DiskManager` (Phase 1). Everything else in the design below comes from the project PRD/TRD and describes the target, not existing code; `execution/` and `transaction/` hold only READMEs, and `main.go` is empty.
+MS_DB is a personal toy database engine written from scratch in Go (module `github.com/MinseongKim-dev/ms_db`, Go 1.22), following a 5-phase roadmap equivalent to CMU 15-445 BusTub. Implemented so far: `storage.DiskManager` and `storage.SlottedPage` (Phase 1). Everything else in the design below comes from the project PRD/TRD and describes the target, not existing code; `execution/` and `transaction/` hold only READMEs, and `main.go` is empty.
 
 ## Commands
 

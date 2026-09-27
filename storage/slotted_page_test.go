@@ -72,12 +72,15 @@ func TestMaxSizeTuple(t *testing.T) {
 	if !bytes.Equal(mustGet(t, p, id), want) {
 		t.Fatal("max-size tuple corrupted")
 	}
-	if p.FreeSpace() != 0 {
-		t.Fatalf("FreeSpace after max tuple = %d, want 0", p.FreeSpace())
-	}
 	// Even an empty tuple needs a slot, so the page is now full.
+	if p.CanInsert(0) {
+		t.Fatal("CanInsert(0) = true on a full page")
+	}
 	if _, err := p.Insert(nil); !errors.Is(err, ErrPageFull) {
 		t.Fatalf("Insert into full page: got %v, want ErrPageFull", err)
+	}
+	if !bytes.Equal(mustGet(t, p, id), want) {
+		t.Fatal("max-size tuple corrupted by rejected insert")
 	}
 }
 
@@ -99,8 +102,8 @@ func TestFillUntilFull(t *testing.T) {
 		tuple := fill(r, r.Intn(200))
 		id, err := p.Insert(tuple)
 		if errors.Is(err, ErrPageFull) {
-			if p.FreeSpace() >= len(tuple) {
-				t.Fatalf("ErrPageFull with FreeSpace %d >= tuple %d", p.FreeSpace(), len(tuple))
+			if p.CanInsert(len(tuple)) {
+				t.Fatalf("ErrPageFull but CanInsert(%d) = true", len(tuple))
 			}
 			break
 		}
@@ -131,6 +134,50 @@ func TestFailedInsertLeavesPageUnchanged(t *testing.T) {
 	}
 	if !bytes.Equal(mustGet(t, p, idA), a) {
 		t.Fatal("existing tuple corrupted by failed insert")
+	}
+}
+
+func TestCanInsertBounds(t *testing.T) {
+	p := newPage(t)
+	if !p.CanInsert(0) || !p.CanInsert(MaxTupleSize) {
+		t.Fatal("empty page must accept 0 and MaxTupleSize")
+	}
+	if p.CanInsert(MaxTupleSize+1) || p.CanInsert(-1) {
+		t.Fatal("CanInsert accepted an impossible size")
+	}
+}
+
+func TestDeleteTrimsOnlyTrailingSlots(t *testing.T) {
+	p := newPage(t)
+	a := mustInsert(t, p, []byte("a"))
+	b := mustInsert(t, p, []byte("b"))
+	c := mustInsert(t, p, []byte("c"))
+
+	// Deleting a middle slot must not shift later slot IDs.
+	if err := p.Delete(b); err != nil {
+		t.Fatal(err)
+	}
+	if p.NumSlots() != 3 {
+		t.Fatalf("NumSlots after middle delete = %d, want 3", p.NumSlots())
+	}
+	if !bytes.Equal(mustGet(t, p, c), []byte("c")) {
+		t.Fatal("slot c moved after deleting b")
+	}
+
+	// Deleting the last slot trims it and the deleted slot before it.
+	if err := p.Delete(c); err != nil {
+		t.Fatal(err)
+	}
+	if p.NumSlots() != 1 {
+		t.Fatalf("NumSlots after trailing delete = %d, want 1", p.NumSlots())
+	}
+	if !bytes.Equal(mustGet(t, p, a), []byte("a")) {
+		t.Fatal("slot a corrupted by trimming")
+	}
+	for _, id := range []SlotID{b, c} {
+		if _, err := p.Get(id); !errors.Is(err, ErrSlotNotFound) {
+			t.Fatalf("Get(%d) after trim: got %v, want ErrSlotNotFound", id, err)
+		}
 	}
 }
 
@@ -264,18 +311,18 @@ func TestRandomChurn(t *testing.T) {
 			delete(model, victim)
 		} else {
 			tuple := fill(r, sizes())
-			free := p.FreeSpace()
+			fits := p.CanInsert(len(tuple))
 			id, err := p.Insert(tuple)
 			switch {
 			case errors.Is(err, ErrPageFull):
-				if len(tuple) <= free {
-					t.Fatalf("step %d: ErrPageFull but FreeSpace %d >= %d", step, free, len(tuple))
+				if fits {
+					t.Fatalf("step %d: ErrPageFull but CanInsert(%d) was true", step, len(tuple))
 				}
 			case err != nil:
 				t.Fatalf("step %d: Insert: %v", step, err)
 			default:
-				if len(tuple) > free {
-					t.Fatalf("step %d: inserted %d bytes but FreeSpace was %d", step, len(tuple), free)
+				if !fits {
+					t.Fatalf("step %d: inserted %d bytes but CanInsert was false", step, len(tuple))
 				}
 				if _, dup := model[id]; dup {
 					t.Fatalf("step %d: Insert returned live slot %d", step, id)

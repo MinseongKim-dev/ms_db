@@ -40,8 +40,8 @@ const (
 //	[freeSpaceEnd:len) tuple data, growing downward from the end
 //
 // The slot array grows up and tuple data grows down, meeting in the middle.
-// Delete only marks the slot free; space is reclaimed lazily by compaction
-// when an insert needs contiguous room.
+// Delete marks the slot free (trimming trailing free slots); tuple space is
+// reclaimed lazily by compaction when an insert needs contiguous room.
 type SlottedPage struct {
 	data []byte
 }
@@ -86,15 +86,20 @@ func (p *SlottedPage) Bytes() []byte { return p.data }
 // NumSlots returns the size of the slot array, including deleted slots.
 func (p *SlottedPage) NumSlots() int { return p.numSlots() }
 
-// FreeSpace returns the largest tuple that Insert would currently accept,
-// counting space reclaimable by compaction and the cost of a new slot.
-func (p *SlottedPage) FreeSpace() int {
+// CanInsert reports whether Insert would accept a tuple of n bytes.
+func (p *SlottedPage) CanInsert(n int) bool {
+	return n >= 0 && n <= MaxTupleSize && n <= p.available()
+}
+
+// available returns the largest tuple Insert could store, counting space
+// reclaimable by compaction and the cost of a new slot if no deleted slot can
+// be reused. It is negative when not even an empty tuple fits; it is kept
+// internal because clamping it to 0 would make "a 0-byte tuple fits" and
+// "nothing fits" look the same.
+func (p *SlottedPage) available() int {
 	free := len(p.data) - p.headerEnd() - p.liveBytes()
 	if p.findDeletedSlot() < 0 {
 		free -= slotSize
-	}
-	if free < 0 {
-		return 0
 	}
 	return free
 }
@@ -105,8 +110,8 @@ func (p *SlottedPage) Insert(tuple []byte) (SlotID, error) {
 	if len(tuple) > MaxTupleSize {
 		return 0, fmt.Errorf("%w: %d > %d", ErrTupleTooLarge, len(tuple), MaxTupleSize)
 	}
-	if len(tuple) > p.FreeSpace() {
-		return 0, fmt.Errorf("%w: need %d, have %d", ErrPageFull, len(tuple), p.FreeSpace())
+	if !p.CanInsert(len(tuple)) {
+		return 0, fmt.Errorf("%w: need %d, have %d", ErrPageFull, len(tuple), p.available())
 	}
 
 	slot := p.findDeletedSlot()
@@ -147,6 +152,17 @@ func (p *SlottedPage) Delete(id SlotID) error {
 		return err
 	}
 	p.setSlot(int(id), deletedOffset, 0)
+	// Shrink the slot array past trailing deleted slots so their header space
+	// is returned. Deleted slots in the middle must stay: removing them would
+	// shift the IDs of every later slot and break RIDs held elsewhere.
+	n := p.numSlots()
+	for n > 0 {
+		if off, _ := p.slot(n - 1); off != deletedOffset {
+			break
+		}
+		n--
+	}
+	p.setNumSlots(n)
 	return nil
 }
 
