@@ -46,5 +46,16 @@ Single Go binary with layered modules. Dependency direction is strictly **storag
 
 ## Workflow conventions
 
-- One Claude session per phase; at phase end, record a summary in `progress.md` and `/clear`.
+- One Claude session per phase; at phase end the user writes a summary in `progress.md` and runs `/clear`.
 - Guardrail hooks (planned): same-error circuit breaker (block after 2 consecutive identical `go build`/`go test` failures per file+error signature), race-detector output compressor, custom `go/ast`/`go/packages` dependency graph from Phase 3. All hooks must **fail open** (exit 0 on internal error).
+
+## Working with the user (learning project)
+
+The purpose of this repo is for the user to learn DB internals (DDIA + systems programming coursework), so these rules take priority over speed:
+
+1. **Completion criterion first.** Every implementation request should open with a one-line completion criterion for the phase (e.g. "SlottedPage must not corrupt variable-length tuples at extreme sizes"). If a request lacks one, ask for it before implementing — do not invent your own criterion, since drifting criteria break consistency between modules.
+2. **No commits of concurrency/recovery code before the user reviews it.** For MVCC (Phase 3), ARIES (Phase 4), and Raft (Phase 5), stop after tests pass and hand over for line-by-line review, even if tests are green. Point out the edge cases worth checking (e.g. "what happens if two transactions enter this lock at once?"), since bugs outside test coverage are not caught by passing tests.
+3. **Be ready to justify design choices.** After delivering code, the user will ask why a data structure was chosen or what breaks without a given lock. Answer with the concrete failure scenario, not just the conclusion.
+4. **Diagnose before fixing.** When a test fails, explain the root cause first and wait for the user before changing code. Do not jump straight to a fix.
+5. **Do not write `progress.md` session summaries.** The user writes their own 3-line summary at the end of each session.
+6. **When the circuit breaker trips, stop.** Do not retry or look for a workaround. Tell the user the approach is likely wrong and point to the relevant DDIA chapter or course material to re-read.
