@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-MS_DB is a personal toy database engine written from scratch in Go (module `github.com/MinseongKim-dev/ms_db`, Go 1.22), following a 5-phase roadmap equivalent to CMU 15-445 BusTub. The repo is currently a skeleton: `storage/`, `main.go` contain only package declarations; `execution/` and `transaction/` hold only READMEs. The design below comes from the project PRD/TRD and describes the target, not existing code.
+MS_DB is a personal toy database engine written from scratch in Go (module `github.com/MinseongKim-dev/ms_db`, Go 1.22), following a 5-phase roadmap equivalent to CMU 15-445 BusTub. Implemented so far: `storage.DiskManager` (Phase 1). Everything else in the design below comes from the project PRD/TRD and describes the target, not existing code; `execution/` and `transaction/` hold only READMEs, and `main.go` is empty.
 
 ## Commands
 
@@ -30,6 +30,13 @@ Single Go binary with layered modules. Dependency direction is strictly **storag
 | recovery | — | WALManager (log written before page modification), ARIES recovery (Analysis → Redo → Undo) |
 | consensus | — | Raft leader election + log replication across ≥3 processes (membership change / log compaction deferred); net/rpc or gRPC |
 | dashboard | — | Three.js + WebSocket visualization of engine events |
+| wire (stretch) | `server/` | PostgreSQL wire-protocol emulation so a stock pgjdbc client (`jdbc:postgresql://localhost:5432/ms_db`) can talk to MS_DB. Top-most layer; see `server/README.md` for protocol scope and pgjdbc gotchas |
+
+### Wire-protocol track (demo/integration layer)
+
+- Separate from the 5-phase learning core and the **first thing to defer** when the core slips; never let it block a phase.
+- Developed in parallel against a stub executor (fixed responses like `SELECT 1`). `server/` defines the executor interface it needs; the stub implements it now, and `execution/` is plugged in once Phase 2 is done. `server/` may import `execution/`, never the reverse.
+- Demo target is plain JDBC / JdbcTemplate (e.g. the school board app). JPA/Hibernate is out of scope because it requires emulating `pg_catalog`.
 
 ## Design rules
 
