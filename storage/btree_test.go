@@ -391,8 +391,11 @@ func TestDefaultFanoutManyKeys(t *testing.T) {
 		mustInsertKey(t, bt, k)
 		want[k] = true
 	}
-	if h := treeHeight(t, bt); h < 3 {
-		t.Fatalf("height %d, expected at least 3 with 30000 keys", h)
+	// 30000 random keys fill about 130 leaves, which fit under one root, so
+	// the page-sized tree has height 2: this checks that the root split with
+	// real page encoding. Deeper trees are covered by the small-fanout tests.
+	if h := treeHeight(t, bt); h < 2 {
+		t.Fatalf("height %d, expected the root to have split", h)
 	}
 	bt, dm = reopenTree(t, dm, path)
 	defer dm.Close()
