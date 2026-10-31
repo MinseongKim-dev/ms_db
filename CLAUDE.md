@@ -24,13 +24,20 @@ Single Go binary with layered modules. Dependency direction is strictly **storag
 
 | Module | Current dir | Responsibility |
 | --- | --- | --- |
-| storage | `storage/` | DiskManager (4KB page I/O, per-page CRC32 checksum to detect torn pages), SlottedPage for variable-length tuples, B-Tree index, vector-embedding byte layout (ANN/HNSW deferred to a later phase) |
-| query | `execution/` | SQL parser → AST → relational-algebra plan nodes → Volcano-style iterators (Scan/Join/Project); Block Nested Loop Join for large joins. Optional Groq "Agentic Optimizer" with per-query-shape caching and a heuristic fallback (join smaller table first) on API failure/timeout |
-| txn | `transaction/` | `sync.RWMutex`-based 2PL first, then **fully replaced** by MVCC (append-only tuple versions, `AS OF` snapshot queries). Never keep 2PL and MVCC side by side |
+| storage | `storage/` | DiskManager (4KB page I/O, per-page CRC32 checksum to detect torn pages), SlottedPage for variable-length tuples, B-Tree index, buffer pool (LRU, pin/unpin), vector-embedding byte layout (ANN/HNSW deferred to a later phase) |
+| query | `execution/` | SQL parser → AST → relational-algebra plan nodes → Volcano-style iterators (Scan/Join/Project); Block Nested Loop Join and Hash Join. Optional Groq "Agentic Optimizer" with per-query-shape caching and a heuristic fallback (join smaller table first) on API failure/timeout |
+| txn | `transaction/` | `sync.RWMutex`-based 2PL with wait-for-graph deadlock detection first, then **fully replaced** by MVCC (append-only tuple versions, `AS OF` snapshot queries). Never keep 2PL and MVCC side by side |
 | recovery | — | WALManager (log written before page modification), ARIES recovery (Analysis → Redo → Undo) |
 | consensus | — | Raft leader election + log replication across ≥3 processes (membership change / log compaction deferred); net/rpc or gRPC |
 | dashboard | — | Three.js + WebSocket visualization of engine events |
 | wire (stretch) | `server/` | PostgreSQL wire-protocol emulation so a stock pgjdbc client (`jdbc:postgresql://localhost:5432/ms_db`) can talk to MS_DB. Top-most layer; see `server/README.md` for protocol scope and pgjdbc gotchas |
+
+### Roadmap additions (from comparing with SWE3003 Assignment #3)
+
+1. **Buffer pool (Phase 1 addendum, before Phase 2):** LRU page cache over DiskManager with `FetchPage`/`NewPage`/`UnpinPage`. Every fetch must be matched by an unpin; a leaked pin eventually exhausts the pool. The B+Tree moves from direct DiskManager access onto it. Phase 2 executors and Phase 4 ARIES (dirty pages) depend on it.
+2. **B+Tree duplicate and VARCHAR keys (around Phase 2, for secondary indexes):** lookups return all RIDs for a key and delete removes an exact `(key, rid)` entry. The current `childIndex` goes right on a key equal to a separator, which is only correct for unique keys: with duplicates spanning leaves, search must go **left** on equality and then scan right along the leaf chain (insert may still go right).
+3. **Hash join (Phase 2):** build a hash table from the right child keyed by the join column, then probe with each left tuple; duplicates on either side produce all combinations, and re-`Init` must restart cleanly. Runs alongside Block NLJ for comparison.
+4. **Deadlock detection (Phase 3, part of 2PL completion):** periodically build a wait-for graph (A → B if A waits for a lock B holds), find a cycle, abort the transaction with the **largest txn_id on the cycle** (never one that only leads into a cycle), and wake waiters. Abort no one when there is no cycle.
 
 ### Wire-protocol track (demo/integration layer)
 
@@ -66,3 +73,4 @@ The purpose of this repo is for the user to learn DB internals (DDIA + systems p
 4. **Diagnose before fixing.** When a test fails, explain the root cause first and wait for the user before changing code. Do not jump straight to a fix.
 5. **Do not write `progress.md` session summaries.** The user writes their own 3-line summary at the end of each session.
 6. **When the circuit breaker trips, stop.** Do not retry or look for a workaround. Tell the user the approach is likely wrong and point to the relevant DDIA chapter or course material to re-read.
+7. **Keep school assignments separate (academic integrity).** SWE3003 submissions are checked for similarity against each other and public implementations. Never write or translate code for an ongoing assignment, and never port MS_DB code into one; help with concepts and failure diagnosis only. Do not commit assignment code into this repository.
