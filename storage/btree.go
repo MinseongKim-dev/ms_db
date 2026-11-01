@@ -26,7 +26,7 @@ const (
 )
 
 // BTree is a B+Tree index from unique int64 keys to RIDs, stored in its own
-// file via a DiskManager.
+// file and accessed through a BufferPool.
 //
 // Page 0 is a meta page (magic | root PageID | leafMax | internalMax); every
 // other page is one node. Values live only in leaves, and leaves are linked
@@ -36,21 +36,25 @@ const (
 // Not safe for concurrent use (latch crabbing is Phase 3), and a crash in the
 // middle of a split or merge can leave the file inconsistent (WAL is Phase 4).
 // Pages emptied by merges are not reused yet.
+//
+// Every page access pins the page only for the moment it takes to decode or
+// encode a node, so the tree never holds more than one pin and never leaks
+// one, even on error paths.
 type BTree struct {
-	dm          *DiskManager
+	bp          *BufferPool
 	root        PageID
 	leafMax     int
 	internalMax int
 }
 
-// OpenBTree opens the index stored in dm, creating an empty tree if the file
-// is empty. opts may be nil for page-sized nodes.
-func OpenBTree(dm *DiskManager, opts *BTreeOptions) (*BTree, error) {
-	if dm.NumPages() > 0 {
-		return loadBTree(dm)
+// OpenBTree opens the index stored in bp's file, creating an empty tree if the
+// file is empty. opts may be nil for page-sized nodes.
+func OpenBTree(bp *BufferPool, opts *BTreeOptions) (*BTree, error) {
+	if bp.dm.NumPages() > 0 {
+		return loadBTree(bp)
 	}
 
-	bt := &BTree{dm: dm, leafMax: maxLeafKeys, internalMax: maxInternalKeys}
+	bt := &BTree{bp: bp, leafMax: maxLeafKeys, internalMax: maxInternalKeys}
 	if opts != nil {
 		if opts.LeafMax < 3 || opts.LeafMax > maxLeafKeys {
 			return nil, fmt.Errorf("storage: LeafMax %d out of range [3, %d]", opts.LeafMax, maxLeafKeys)
@@ -61,10 +65,15 @@ func OpenBTree(dm *DiskManager, opts *BTreeOptions) (*BTree, error) {
 		bt.leafMax, bt.internalMax = opts.LeafMax, opts.InternalMax
 	}
 
-	if id, err := dm.AllocatePage(); err != nil {
+	meta, err := bp.NewPage()
+	if err != nil {
 		return nil, err
-	} else if id != metaPageID {
-		return nil, fmt.Errorf("storage: meta page allocated at %d, want %d", id, metaPageID)
+	}
+	if err := bp.UnpinPage(meta.ID(), false); err != nil {
+		return nil, err
+	}
+	if meta.ID() != metaPageID {
+		return nil, fmt.Errorf("storage: meta page allocated at %d, want %d", meta.ID(), metaPageID)
 	}
 	rootID, err := bt.allocNode(&node{leaf: true, next: InvalidPageID})
 	if err != nil {
@@ -76,29 +85,39 @@ func OpenBTree(dm *DiskManager, opts *BTreeOptions) (*BTree, error) {
 	return bt, nil
 }
 
-func loadBTree(dm *DiskManager) (*BTree, error) {
-	buf := make([]byte, PageDataSize)
-	if err := dm.ReadPage(metaPageID, buf); err != nil {
+func loadBTree(bp *BufferPool) (*BTree, error) {
+	meta, err := bp.FetchPage(metaPageID)
+	if err != nil {
 		return nil, err
 	}
-	if binary.LittleEndian.Uint32(buf[0:4]) != btreeMagic {
-		return nil, fmt.Errorf("%w: bad meta page magic", ErrCorruptNode)
-	}
-	return &BTree{
-		dm:          dm,
+	buf := meta.Data()
+	bt := &BTree{
+		bp:          bp,
 		root:        PageID(binary.LittleEndian.Uint32(buf[4:8])),
 		leafMax:     int(binary.LittleEndian.Uint16(buf[8:10])),
 		internalMax: int(binary.LittleEndian.Uint16(buf[10:12])),
-	}, nil
+	}
+	magic := binary.LittleEndian.Uint32(buf[0:4])
+	if err := bp.UnpinPage(metaPageID, false); err != nil {
+		return nil, err
+	}
+	if magic != btreeMagic {
+		return nil, fmt.Errorf("%w: bad meta page magic", ErrCorruptNode)
+	}
+	return bt, nil
 }
 
 func (bt *BTree) setRoot(id PageID) error {
-	buf := make([]byte, PageDataSize)
+	meta, err := bt.bp.FetchPage(metaPageID)
+	if err != nil {
+		return err
+	}
+	buf := meta.Data()
 	binary.LittleEndian.PutUint32(buf[0:4], btreeMagic)
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(id))
 	binary.LittleEndian.PutUint16(buf[8:10], uint16(bt.leafMax))
 	binary.LittleEndian.PutUint16(buf[10:12], uint16(bt.internalMax))
-	if err := bt.dm.WritePage(metaPageID, buf); err != nil {
+	if err := bt.bp.UnpinPage(metaPageID, true); err != nil {
 		return err
 	}
 	bt.root = id
@@ -394,12 +413,17 @@ func mergeInto(left, right *node, sep int64) {
 	left.children = append(left.children, right.children...)
 }
 
+// readNode decodes page id into a node. decodeNode copies everything out of
+// the page, so the pin is released before returning.
 func (bt *BTree) readNode(id PageID) (*node, error) {
-	buf := make([]byte, PageDataSize)
-	if err := bt.dm.ReadPage(id, buf); err != nil {
+	p, err := bt.bp.FetchPage(id)
+	if err != nil {
 		return nil, err
 	}
-	n, err := decodeNode(buf)
+	n, err := decodeNode(p.Data())
+	if uerr := bt.bp.UnpinPage(id, false); uerr != nil && err == nil {
+		err = uerr
+	}
 	if err != nil {
 		return nil, fmt.Errorf("page %d: %w", id, err)
 	}
@@ -407,9 +431,12 @@ func (bt *BTree) readNode(id PageID) (*node, error) {
 }
 
 func (bt *BTree) writeNode(id PageID, n *node) error {
-	buf := make([]byte, PageDataSize)
-	n.encode(buf)
-	return bt.dm.WritePage(id, buf)
+	p, err := bt.bp.FetchPage(id)
+	if err != nil {
+		return err
+	}
+	n.encode(p.Data())
+	return bt.bp.UnpinPage(id, true)
 }
 
 func (bt *BTree) writeNodes(id1 PageID, n1 *node, id2 PageID, n2 *node) error {
@@ -420,11 +447,12 @@ func (bt *BTree) writeNodes(id1 PageID, n1 *node, id2 PageID, n2 *node) error {
 }
 
 func (bt *BTree) allocNode(n *node) (PageID, error) {
-	id, err := bt.dm.AllocatePage()
+	p, err := bt.bp.NewPage()
 	if err != nil {
 		return InvalidPageID, err
 	}
-	return id, bt.writeNode(id, n)
+	n.encode(p.Data())
+	return p.ID(), bt.bp.UnpinPage(p.ID(), true)
 }
 
 // lowerBound returns the first index whose key is >= key.
