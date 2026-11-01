@@ -14,9 +14,15 @@ import (
 // multi-level splits (including root splits) every key is still returned in
 // sorted order; and the tree survives reopening the file.
 // Scope decision: delete is included, with full rebalancing (borrow/merge).
+//
+// Buffer pool addendum: the tree runs on a small buffer pool, and every
+// operation must unpin every page it fetched (NumPinnedPages() == 0 after).
 
 // smallFanout forces many splits and merges with few keys.
 var smallFanout = &BTreeOptions{LeafMax: 4, InternalMax: 4}
+
+// treePoolSize is deliberately tiny so the tree constantly evicts pages.
+const treePoolSize = 4
 
 func openTree(t *testing.T, opts *BTreeOptions) (*BTree, *DiskManager, string) {
 	t.Helper()
@@ -25,15 +31,20 @@ func openTree(t *testing.T, opts *BTreeOptions) (*BTree, *DiskManager, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bt, err := OpenBTree(dm, opts)
+	bt, err := OpenBTree(NewBufferPool(dm, treePoolSize), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return bt, dm, path
 }
 
-func reopenTree(t *testing.T, dm *DiskManager, path string) (*BTree, *DiskManager) {
+// reopenTree flushes the pool, closes the file and opens it again with a
+// fresh pool, so only what reached disk survives.
+func reopenTree(t *testing.T, bt *BTree, dm *DiskManager, path string) (*BTree, *DiskManager) {
 	t.Helper()
+	if err := bt.bp.FlushAll(); err != nil {
+		t.Fatal(err)
+	}
 	if err := dm.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -41,11 +52,18 @@ func reopenTree(t *testing.T, dm *DiskManager, path string) (*BTree, *DiskManage
 	if err != nil {
 		t.Fatal(err)
 	}
-	bt, err := OpenBTree(dm, nil)
+	bt, err = OpenBTree(NewBufferPool(dm, treePoolSize), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return bt, dm
+}
+
+func checkNoPins(t *testing.T, bt *BTree) {
+	t.Helper()
+	if n := bt.bp.NumPinnedPages(); n != 0 {
+		t.Fatalf("%d pages still pinned", n)
+	}
 }
 
 func ridFor(k int64) RID {
@@ -99,6 +117,7 @@ func checkContents(t *testing.T, bt *BTree, want map[int64]bool) {
 			t.Fatalf("Search(%d) = %v, %v, %v", k, rid, ok, err)
 		}
 	}
+	checkNoPins(t, bt)
 }
 
 // verifyTree checks the structural invariants of the whole tree:
@@ -107,6 +126,8 @@ func checkContents(t *testing.T, bt *BTree, want map[int64]bool) {
 // visiting every leaf left to right.
 func verifyTree(t *testing.T, bt *BTree) {
 	t.Helper()
+	checkNoPins(t, bt)
+	defer checkNoPins(t, bt)
 	var leaves []PageID
 	leafDepth := -1
 	var walk func(id PageID, lo, hi *int64, depth int, isRoot bool)
@@ -355,7 +376,7 @@ func TestPersistsAcrossReopenBTree(t *testing.T) {
 	}
 	h := treeHeight(t, bt)
 
-	bt, dm = reopenTree(t, dm, path)
+	bt, dm = reopenTree(t, bt, dm, path)
 	defer func() { dm.Close() }()
 	if bt.leafMax != smallFanout.LeafMax || bt.internalMax != smallFanout.InternalMax {
 		t.Fatalf("fanout not persisted: %d/%d", bt.leafMax, bt.internalMax)
@@ -371,7 +392,7 @@ func TestPersistsAcrossReopenBTree(t *testing.T) {
 		mustInsertKey(t, bt, k)
 		want[k] = true
 	}
-	bt, dm = reopenTree(t, dm, path)
+	bt, dm = reopenTree(t, bt, dm, path)
 	verifyTree(t, bt)
 	checkContents(t, bt, want)
 }
@@ -397,7 +418,7 @@ func TestDefaultFanoutManyKeys(t *testing.T) {
 	if h := treeHeight(t, bt); h < 2 {
 		t.Fatalf("height %d, expected the root to have split", h)
 	}
-	bt, dm = reopenTree(t, dm, path)
+	bt, dm = reopenTree(t, bt, dm, path)
 	defer dm.Close()
 	verifyTree(t, bt)
 	checkContents(t, bt, want)
@@ -417,7 +438,7 @@ func TestInvalidOptions(t *testing.T) {
 		{LeafMax: 4, InternalMax: maxInternalKeys + 1},
 	} {
 		o := o
-		if _, err := OpenBTree(dm, &o); err == nil {
+		if _, err := OpenBTree(NewBufferPool(dm, treePoolSize), &o); err == nil {
 			t.Fatalf("OpenBTree(%+v) succeeded, want error", o)
 		}
 	}
@@ -519,8 +540,36 @@ func TestRandomInsertDeleteChurn(t *testing.T) {
 			checkContents(t, bt, model)
 		}
 	}
-	bt, dm = reopenTree(t, dm, path)
+	bt, dm = reopenTree(t, bt, dm, path)
 	defer dm.Close()
 	verifyTree(t, bt)
 	checkContents(t, bt, model)
+}
+
+// TestBTreeWithOneFramePool shows the tree never needs more than one page
+// pinned at a time: every operation works through a single-frame pool.
+func TestBTreeWithOneFramePool(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "one.db")
+	dm, err := OpenDiskManager(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dm.Close()
+	bt, err := OpenBTree(NewBufferPool(dm, 1), smallFanout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int64]bool{}
+	for k := int64(0); k < 200; k++ {
+		mustInsertKey(t, bt, k)
+		want[k] = true
+	}
+	for k := int64(0); k < 200; k += 2 {
+		if err := bt.Delete(k); err != nil {
+			t.Fatalf("Delete(%d): %v", k, err)
+		}
+		delete(want, k)
+	}
+	verifyTree(t, bt)
+	checkContents(t, bt, want)
 }
